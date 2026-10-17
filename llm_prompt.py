@@ -1,18 +1,21 @@
+from insertQdrantPoint import insert_resume
 from google import genai
 from dotenv import load_dotenv
 import os
-from fastapi import FastAPI
+# pyrefly: ignore [missing-import]
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 from typing import List
+import uuid
 
 from github_service import fetch_readme
 from qdrantConnection import client as qdrant_client
-
+from qdrantCollection import create_collection
 from generateEmbeddings import get_embedding
-from qdrant_client.models import PointStruct
+from insertQdrantPoint import insert_readme
+from fetchRelevanceReadme import search_readmes
 
-import uuid
 
 load_dotenv(".env")
 
@@ -23,100 +26,158 @@ client = genai.Client(api_key=api_key)
 
 app = FastAPI()
 
+
+# ---------------- DTO Classes ----------------
+
 class ResumeInfo(BaseModel):
+    userId: str
     text: str
     githubProfile: str
     githubRepositories: List[str]
 
+
 class LLMRequest(BaseModel):
+    userId: str
     prompt: str
     resumeInfo: ResumeInfo
 
 
+
+# ---------------- Index Resume ----------------
+
 @app.post("/indexResume")
 def index_resume(request: ResumeInfo):
+    try:
+        create_collection()
 
-    for repo_url in request.githubRepositories:
-        repo_name, readme = fetch_readme(repo_url)
+        user_id = request.userId
+        resume_chunks = 0
+        readme_chunks = 0
 
-        if readme is None:
-            continue
+        if request.text and request.text.strip():
+            resume_chunks = insert_resume(user_id,request.text)
 
-        embedding = get_embedding(readme)
+        for repo_url in request.githubRepositories or []:
+            repo_name, readme = fetch_readme(repo_url)
 
-        point = PointStruct(
-            id=str(uuid.uuid4()),
-            vector=embedding,
-            payload={
-                "type": "readme",
-                "repo_name": repo_name,
-                "repo_url": repo_url,
-                "content": readme
-            }
+            if readme and readme.strip():
+                readme_chunks += insert_readme(
+                    user_id=user_id,
+                    repo_name=repo_name,
+                    repo_url=repo_url,
+                    readme=readme
+                )
+
+        info = qdrant_client.get_collection(
+            collection_name="resume_readmes"
         )
 
-        qdrant_client.upsert(
-            collection_name="resume_readmes",
-            points=[point]
+        return {
+            "message": "Indexing completed successfully.",
+            "user_id": user_id,
+            "resume_chunks": resume_chunks,
+            "readme_chunks": readme_chunks,
+            "total_points_in_collection": info.points_count
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error while indexing resume: {str(e)}"
         )
 
-    info = qdrant_client.get_collection("resume_readmes")
-    total_points = info.points_count
 
-    return {
-        "message": "Indexing completed",
-        "total_points_in_collection": total_points
-    }
 
+
+# ---------------- Ask LLM ----------------
 
 @app.post("/ask")
-def ask(request: LLMRequest):
+def ask(userId: str, prompt: str):
+    try:
+        matched_points = search_readmes(userId, prompt)
 
-    # 1. Convert question → embedding
-    query_embedding = get_embedding(request.prompt)
+        if not matched_points:
+            return {
+                "answer": "No relevant information found in the indexed documents."
+            }
 
-    # 2. Search Qdrant
-    search_result = qdrant_client.query_points(collection_name="resume_readmes",
-                                                query=query_embedding, 
-                                                limit=3)
+        context = ""
 
-    # 3. Build context from matches
-    matched_readmes = ""
+        for point in matched_points:
+            payload = point.payload or {}
 
-    for point in search_result.points:
-        matched_readmes += f"""
-            Repository: {point.payload['repo_name']}
-            URL: {point.payload['repo_url']}
-            README: {point.payload['content']}
+            context += f"""
+Document Type: {payload.get('type', 'unknown')}
+Repository: {payload.get('repo_name', 'N/A')}
+Chunk Index: {payload.get('chunk_index', 'N/A')}
 
-            ========================
-        """
+Content:
+{payload.get('content', '')}
 
-    # 4. Build LLM input
-    llm_input = f"""
-        Resume: {request.resumeInfo.text}
-        Relevant GitHub Projects: {matched_readmes}
-        Question: {request.prompt}
-        """
+-------------------------
+"""
 
-    # 5. Call Gemini
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=llm_input
-    )
+        llm_input = f"""
+Answer the question using only the relevant document chunks below.
 
-    return {
-        "answer": response.text
-    }
-   
+If the context does not contain enough information, say so.
+Do not invent information.
+
+Relevant Chunks:
+{context}
+
+Question:
+{prompt}
+"""
+
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=llm_input
+        )
+
+        return {
+            "answer": response.text,
+            "retrieved_chunks": len(matched_points)
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error while asking LLM: {str(e)}"
+        )
+
+
+
+# ---------------- Qdrant Health Check ----------------
 
 @app.get("/checkQdrantConnection")
 def check_qdrant_connection():
+
     try:
-        qdrant_client.get_collections()
-        return {"status": "Qdrant connection is working" + str(qdrant_client.get_collections())}
+
+        collections = qdrant_client.get_collections()
+
+        return {
+            "status": "Qdrant connection is working",
+            "collections": str(collections)
+        }
+
+
     except Exception as e:
-        return {"status": "Qdrant connection failed", "error": str(e)}
+
+        return {
+            "status": "Qdrant connection failed",
+            "error": str(e)
+        }
+
+
+
+# ---------------- Main ----------------
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000
+    )

@@ -11,7 +11,7 @@ def create_collection():
         qdrant_client.create_collection(
             collection_name="resume_readmes",
             vectors_config=VectorParams(
-                size=768,
+                size=3072,
                 distance=Distance.COSINE
             )
         )
